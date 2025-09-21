@@ -880,7 +880,7 @@ def grade_attempt_parallel(aid: str, qidx: Dict[str, dict], max_workers: int = N
 # ============================
 BASE = Path(__file__).resolve().parent
 FONT_R = BASE / "assets/fonts/LXGWWenKai-Regular.ttf"
-FONT_M = BASE / "assets/fonts/LXGWWenKai-Medium.ttf"   # 充当 Bold
+FONT_M = BASE / "assets/fonts/DejaVuSerif-Bold.ttf"   # 充当 Bold
 
 def normalize_and_parse_total(grading_text: str, expected_max: Optional[int]):
     s, m = parse_total(grading_text or "", expected_max)
