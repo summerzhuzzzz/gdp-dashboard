@@ -908,7 +908,7 @@ def _safe_multicell(pdf: FPDF, w, h, txt, *args, **kwargs):
     except TypeError:
         pdf.multi_cell(w, h, t, *args, **kwargs)
         pdf.ln(h * 0.2)
-def _ok(p: Path, min_bytes=1_000_000) -> bool:
+def _ok(p: Path, min_bytes=100_000) -> bool:
     try:
         return p.exists() and p.stat().st_size >= min_bytes
     except Exception:
