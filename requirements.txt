@@ -1,2 +1,7 @@
-streamlit
-pandas
+streamlit>=1.28.0
+psycopg2-binary>=2.9.7
+Pillow>=10.0.0
+fpdf2>=2.7.6
+requests>=2.31.0
+supabase>=2.0.0
+python-dotenv>=1.0.0
