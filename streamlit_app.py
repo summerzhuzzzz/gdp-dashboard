@@ -5,6 +5,8 @@ from io import BytesIO
 
 import streamlit as st
 from PIL import Image
+from pathlib import Path
+from functools import lru_cache
 
 # Supabase
 from supabase import create_client, Client
@@ -876,8 +878,9 @@ def grade_attempt_parallel(aid: str, qidx: Dict[str, dict], max_workers: int = N
 # ============================
 # PDF 导出
 # ============================
-CN_FONT_REGULAR = r"C:\Windows\Fonts\msyh.ttc"
-CN_FONT_BOLD = r"C:\Windows\Fonts\msyhbd.ttc"
+BASE = Path(__file__).resolve().parent
+FONT_R = BASE / "assets/fonts/LXGWWenKai-Regular.ttf"
+FONT_M = BASE / "assets/fonts/LXGWWenKai-Medium.ttf"   # 充当 Bold
 
 def normalize_and_parse_total(grading_text: str, expected_max: Optional[int]):
     s, m = parse_total(grading_text or "", expected_max)
@@ -905,14 +908,28 @@ def _safe_multicell(pdf: FPDF, w, h, txt, *args, **kwargs):
     except TypeError:
         pdf.multi_cell(w, h, t, *args, **kwargs)
         pdf.ln(h * 0.2)
-
-def _setup_cn_font(pdf: FPDF) -> str:
-    fam = "YaHei"
+def _ok(p: Path, min_bytes=1_000_000) -> bool:
     try:
-        pdf.add_font(fam, "", CN_FONT_REGULAR, uni=True)
-        pdf.add_font(fam, "B", CN_FONT_BOLD, uni=True)
-    except RuntimeError:
-        pass
+        return p.exists() and p.stat().st_size >= min_bytes
+    except Exception:
+        return False
+
+@lru_cache(maxsize=1)
+def _cn_font_paths():
+    # 优先：Regular 用 Regular；Bold 用 Medium
+    # 回退：缺哪一个就用另一个兜底，保证不会因为 style="B" 崩
+    if not (_ok(FONT_R) or _ok(FONT_M)):
+        raise RuntimeError("中文字体缺失：请放入 assets/fonts/LXGWWenKai-Regular.ttf / -Medium.ttf")
+    reg  = str(FONT_R if _ok(FONT_R) else FONT_M)
+    bold = str(FONT_M if _ok(FONT_M) else (FONT_R if _ok(FONT_R) else FONT_M))
+    return reg, bold
+def _setup_cn_font(pdf):
+    fam = "CN"
+    if fam not in pdf.fonts:
+        reg, bold = _cn_font_paths()
+        pdf.add_font(fam, "",  reg,  uni=True)  # Regular→常规
+        pdf.add_font(fam, "B", bold, uni=True)  # Medium→粗体（或回退）
+    pdf.set_font(fam, size=12)
     return fam
 
 def _content_area_h(pdf):
@@ -1238,7 +1255,7 @@ def export_pdf(head, answers, qidx, fast_mode: bool = True, qs=None, include_pen
     JPEG_MAXSIDE = 1000 if fast_mode else 1400
     JPEG_QUALITY = 72 if fast_mode else 78
 
-    pdf = FPDF()
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.set_left_margin(15)
     pdf.set_right_margin(15)
