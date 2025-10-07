@@ -7,6 +7,7 @@ import streamlit as st
 from PIL import Image
 from pathlib import Path
 from functools import lru_cache
+from functools import partial
 
 # Supabase
 from supabase import create_client, Client
@@ -528,7 +529,49 @@ def remove_pending_image(aid: str, qno: str, h: str):
         del q_map[h]
     total = sum(len(b) for b in q_map.values())
     st.session_state.pending_sizes.setdefault(aid, {})[qno] = total
+def on_uploader_change(aid: str, qno: str, uploader_key: str):
+    """当 file_uploader 有变动（新增/点X移除/清空）时：
+       - 同步 pending（预览用）
+       - 若本会话曾 flush 过、且建立了 file_to_db_map，则同时删 DB 对应图片
+       - bump 让缓存失效，预览立刻更新
+    """
+    files = st.session_state.get(uploader_key) or []
+    qno_key = f"files_{aid}_{qno}"
 
+    prev_keys = st.session_state.get(qno_key, set())
+    curr_keys = set()
+    if files:
+        curr_keys = {get_file_key(f) for f in files}
+
+    # 1) 被点 X 的文件
+    removed_keys = prev_keys - curr_keys
+    if removed_keys:
+        fh_map = st.session_state.file_hash_map.get(aid, {}).get(qno, {}) or {}
+        h2idx  = st.session_state.file_to_db_map.get(aid, {}).get(qno, {}) or {}
+        for fk in removed_keys:
+            h = fh_map.pop(fk, None)
+            if not h:
+                continue
+            # 先删 pending（这样预览也就没了）
+            remove_pending_image(aid, qno, h)
+            # 若本会话 flush 后建立过 hash→idx，就联动删 DB 里的那张
+            idx = h2idx.pop(h, None)
+            if idx:
+                delete_answer_image(aid, qno, idx)
+
+    # 2) 新增的文件（只进 pending，不入库）
+    added_files = []
+    if files:
+        new_keys = curr_keys - prev_keys
+        if new_keys:
+            fk2file = {get_file_key(f): f for f in files}
+            added_files = [fk2file[fk] for fk in new_keys]
+            if added_files:
+                buffer_uploads(aid, qno, added_files)
+
+    # 3) 覆盖本题“当前选择集”，并 bump 让预览立刻刷新
+    st.session_state[qno_key] = curr_keys
+    st.session_state.img_cache_bump = st.session_state.get("img_cache_bump", 0) + 1
 def flush_all_pending_to_db(aid: str):
     """
     把所有 pending 的图片写入数据库，并“覆盖”对应题目的历史图片。
@@ -763,52 +806,21 @@ def _render_pending_preview(aid: str, qno: str):
     st.caption("提示：评分时会把未入库图片统一写入数据库。若已评分，点击上传列表中文件名右侧的 X 也会同步删除数据库里的对应图片。")
 
 def render_upload_ui(aid: str, qno: str):
-    with st.form(key=f"form_upload_{aid}_{qno}", clear_on_submit=False):
-        uploaded_files = st.file_uploader(
-            f"上传 {qno} 的答案照片 (可多张)",
-            accept_multiple_files=True,
-            type=["jpg", "jpeg", "png"],
-            key=f"upload_pending_{aid}_{qno}",
-        )
+    uploader_key = f"upload_pending_{aid}_{qno}"
+    qno_key = f"files_{aid}_{qno}"
+    st.session_state.setdefault(qno_key, set())
 
-        # === 利用“X”检测：对比前后 keys 集合，定位被点掉的文件 ===
-        qno_key = f"files_{aid}_{qno}"
-        prev_keys = st.session_state.get(qno_key, set())
-        curr_keys = set()
-        if uploaded_files:
-            curr_keys = {get_file_key(f) for f in uploaded_files}
+    st.file_uploader(
+        f"上传 {qno} 的答案照片 (可多张)",
+        accept_multiple_files=True,
+        type=["jpg", "jpeg", "png"],
+        key=uploader_key,
+        on_change=lambda: on_uploader_change(aid, qno, uploader_key),  # ✨关键
+    )
 
-        removed_keys = prev_keys - curr_keys
-        if removed_keys:
-            fh_map = st.session_state.file_hash_map.get(aid, {}).get(qno, {}) or {}
-            h2idx = st.session_state.file_to_db_map.get(aid, {}).get(qno, {}) or {}
-            for fk in removed_keys:
-                h = fh_map.pop(fk, None)
-                if not h:
-                    continue
-                remove_pending_image(aid, qno, h)
-                idx = h2idx.pop(h, None)
-                if idx:
-                    delete_answer_image(aid, qno, idx)
-
-        # 新增文件 -> 暂存
-        added = 0
-        if uploaded_files:
-            added = buffer_uploads(aid, qno, uploaded_files)
-
-        st.session_state[qno_key] = curr_keys
-
-        # 用一个提交按钮把这次所有变更合并
-        submitted = st.form_submit_button("预览答案图片")
-        if submitted:
-            if removed_keys:
-                st.info(f"已移除 {len(removed_keys)} 张")
-            if added > 0:
-                st.success(f"已暂存 {added} 张新图片（未入库）")
-            st.session_state.img_cache_bump += 1
-
-    # 表单外：只有在用户点击了“更新预览/暂存”后才会 rerun 并走到这里显示预览
+    # 实时预览（由 on_change 调整 pending & bump 后，这里会自动刷新）
     _render_pending_preview(aid, qno)
+
 
 
 
