@@ -712,62 +712,86 @@ def show_pending_badge(aid: str, qno: str):
         size_mb = pending_bytes(aid, qno) / (1024 * 1024)
         st.info(f"🟡 暂存未入库：{pc} 张（约 {size_mb:.2f} MB）。评分时会自动写入数据库。")
 
+@st.cache_data(show_spinner=False)
+def _thumb_jpg(raw: bytes, max_side=480, q=70) -> bytes:
+    from PIL import Image
+    from io import BytesIO
+    im = Image.open(BytesIO(raw)).convert("RGB")
+    w, h = im.size
+    if max(w, h) > max_side:
+        s = max_side / max(w, h)
+        im = im.resize((int(w*s), int(h*s)), Image.LANCZOS)
+    buf = BytesIO()
+    im.save(buf, format="JPEG", quality=q, optimize=True, subsampling=2)
+    return buf.getvalue()
 
-def render_upload_ui(aid: str, qno: str):
-    # --- 上传控件 ---
-    uploaded_files = st.file_uploader(
-        f"上传 {qno} 的答案照片 (可多张)",
-        accept_multiple_files=True,
-        type=["jpg", "jpeg", "png"],
-        key=f"upload_pending_{aid}_{qno}",
-    )
-
-    # === 利用“X”检测：对比前后 keys 集合，定位被点掉的文件 ===
-    qno_key = f"files_{aid}_{qno}"
-    prev_keys = st.session_state.get(qno_key, set())
-    curr_keys = set()
-    if uploaded_files:
-        curr_keys = {get_file_key(f) for f in uploaded_files}
-
-    removed_keys = prev_keys - curr_keys
-    if removed_keys:
-        fh_map = st.session_state.file_hash_map.get(aid, {}).get(qno, {}) or {}
-        h2idx = st.session_state.file_to_db_map.get(aid, {}).get(qno, {}) or {}
-        for fk in removed_keys:
-            h = fh_map.pop(fk, None)
-            if not h:
-                continue
-            # 先删 pending
-            remove_pending_image(aid, qno, h)
-            # 如该图已在评分时写入过 DB，则联动删 DB
-            idx = h2idx.pop(h, None)
-            if idx:
-                delete_answer_image(aid, qno, idx)
-        st.session_state[qno_key] = curr_keys
-        st.session_state.img_cache_bump += 1
-
-    # === 把新增文件放入 pending，并建立 file_key→hash 映射 ===
-    if uploaded_files:
-        added = buffer_uploads(aid, qno, uploaded_files)
-        st.session_state[qno_key] = curr_keys
-        if added > 0:
-            st.success(f"已暂存 {added} 张新图片（未入库）")
-            st.session_state.img_cache_bump += 1
-
-    # === 只显示 Pending 预览 ===
+def _render_pending_preview(aid: str, qno: str):
     pend_map = st.session_state.pending_images.get(aid, {}).get(qno, {}) or {}
-    if len(pend_map) > 0:
-        st.write(f"🕒 未入库暂存图片（{len(pend_map)} 张预览）")
-        cols = st.columns(3)
-        for j, (_h, b) in enumerate(pend_map.items()):
-            with cols[j % 3]:
-                try:
-                    st.image(Image.open(BytesIO(b)), caption=f"Pending {j+1}", use_container_width=True)
-                except Exception:
-                    st.write(f"Pending {j+1} (预览失败)")
+    if len(pend_map) == 0:
+        show_pending_badge(aid, qno)
+        st.caption("提示：评分时会把未入库图片统一写入数据库。若已评分，点击上传列表中文件名右侧的 X 也会同步删除数据库里的对应图片。")
+        return
+
+    st.write(f"🕒 未入库暂存图片（{len(pend_map)} 张预览）")
+    cols = st.columns(3)
+    for j, (_h, b) in enumerate(pend_map.items()):
+        with cols[j % 3]:
+            try:
+                # ✅ 使用缩略图缓存
+                st.image(BytesIO(_thumb_jpg(b)), caption=f"Pending {j+1}", use_container_width=True)
+            except Exception:
+                st.write(f"Pending {j+1} (预览失败)")
 
     show_pending_badge(aid, qno)
     st.caption("提示：评分时会把未入库图片统一写入数据库。若已评分，点击上传列表中文件名右侧的 X 也会同步删除数据库里的对应图片。")
+
+def render_upload_ui(aid: str, qno: str):
+    with st.form(key=f"form_upload_{aid}_{qno}", clear_on_submit=False):
+        uploaded_files = st.file_uploader(
+            f"上传 {qno} 的答案照片 (可多张)",
+            accept_multiple_files=True,
+            type=["jpg", "jpeg", "png"],
+            key=f"upload_pending_{aid}_{qno}",
+        )
+
+        # === 利用“X”检测：对比前后 keys 集合，定位被点掉的文件 ===
+        qno_key = f"files_{aid}_{qno}"
+        prev_keys = st.session_state.get(qno_key, set())
+        curr_keys = set()
+        if uploaded_files:
+            curr_keys = {get_file_key(f) for f in uploaded_files}
+
+        removed_keys = prev_keys - curr_keys
+        if removed_keys:
+            fh_map = st.session_state.file_hash_map.get(aid, {}).get(qno, {}) or {}
+            h2idx = st.session_state.file_to_db_map.get(aid, {}).get(qno, {}) or {}
+            for fk in removed_keys:
+                h = fh_map.pop(fk, None)
+                if not h:
+                    continue
+                remove_pending_image(aid, qno, h)
+                idx = h2idx.pop(h, None)
+                if idx:
+                    delete_answer_image(aid, qno, idx)
+
+        # 新增文件 -> 暂存
+        added = 0
+        if uploaded_files:
+            added = buffer_uploads(aid, qno, uploaded_files)
+
+        st.session_state[qno_key] = curr_keys
+
+        # 用一个提交按钮把这次所有变更合并
+        submitted = st.form_submit_button("更新预览/暂存")
+        if submitted:
+            if removed_keys:
+                st.info(f"已移除 {len(removed_keys)} 张")
+            if added > 0:
+                st.success(f"已暂存 {added} 张新图片（未入库）")
+            st.session_state.img_cache_bump += 1
+
+    # 表单外：只有在用户点击了“更新预览/暂存”后才会 rerun 并走到这里显示预览
+    _render_pending_preview(aid, qno)
 
 
 
@@ -1639,7 +1663,7 @@ st.header("评分")
 st.write("上传完所有答案后，点击下方按钮进行评分。（会先把所有暂存图片写入数据库）")
 
 if st.button("开始评分", use_container_width=True):
-    st.cache_data.clear()
+    st.session_state.img_cache_bump = st.session_state.get("img_cache_bump", 0) + 1
     with st.spinner("正在评分，请稍候..."):
         grade_attempt_parallel(aid, qidx)
     st.success("评分完成")
