@@ -91,7 +91,8 @@ if "pending_sizes" not in st.session_state:
     st.session_state.pending_sizes = {}    # {aid: {qno: total_bytes}}
 if "file_hash_map" not in st.session_state:
     st.session_state.file_hash_map = {}    # {aid: {qno: {file_key: hash}}}
-
+if "img_cache_bump" not in st.session_state:
+    st.session_state.img_cache_bump = 0
 
 # ============================
 # 小工具
@@ -299,6 +300,7 @@ def delete_answer_image(aid: str, qno: str, idx: int) -> bool:
                 "image_b64": None,
                 "updated_at": datetime.now(_tz.utc).isoformat(),
             }, on_conflict="attempt_id,qno").execute()
+        st.session_state.img_cache_bump = st.session_state.get("img_cache_bump", 0) + 1
         return True
     except Exception as e:
         st.error(f"删除图片失败: {str(e)}")
@@ -310,13 +312,14 @@ def delete_answer_images(aid: str, qno: str):
         supabase.table("submission_answers").upsert({
             "attempt_id": aid, "qno": qno, "image_b64": None, "updated_at": datetime.now(_tz.utc).isoformat()
         }, on_conflict="attempt_id,qno").execute()
+        st.session_state.img_cache_bump = st.session_state.get("img_cache_bump", 0) + 1
         return True
     except Exception as e:
         st.error(f"删除所有图片失败: {str(e)}")
         return False
 
 @st.cache_data(ttl=300, show_spinner=False)
-def list_answer_images(aid: str, qno: str) -> List[Tuple[int, str]]:
+def list_answer_images(aid: str, qno: str, bump: int = 0) -> List[Tuple[int, str]]:
     try:
         result = supabase.table("submission_answer_images").select(
             "idx, image_b64"
@@ -549,7 +552,7 @@ def flush_all_pending_to_db(aid: str):
             st.warning(f"{qno} 暂存图片未写入数据库（将保留在缓冲区以便重试）。")
 
     if total > 0:
-        st.cache_data.clear()
+        st.session_state.img_cache_bump += 1
     return total
 
 
@@ -740,9 +743,8 @@ def render_upload_ui(aid: str, qno: str):
             idx = h2idx.pop(h, None)
             if idx:
                 delete_answer_image(aid, qno, idx)
-        st.cache_data.clear()
         st.session_state[qno_key] = curr_keys
-        st.rerun()
+        st.session_state.img_cache_bump += 1
 
     # === 把新增文件放入 pending，并建立 file_key→hash 映射 ===
     if uploaded_files:
@@ -750,7 +752,7 @@ def render_upload_ui(aid: str, qno: str):
         st.session_state[qno_key] = curr_keys
         if added > 0:
             st.success(f"已暂存 {added} 张新图片（未入库）")
-            st.rerun()
+            st.session_state.img_cache_bump += 1
 
     # === 只显示 Pending 预览 ===
     pend_map = st.session_state.pending_images.get(aid, {}).get(qno, {}) or {}
@@ -828,7 +830,7 @@ def grade_attempt_parallel(aid: str, qidx: Dict[str, dict], max_workers: int = N
             info = qidx.get(qno, {}) or {}
             ans_row = (answers.get(qno) or {})
             ans_text = ans_row.get("answer_text", "") or ""
-            imgs = [b64 for (_i, b64) in list_answer_images(aid, qno)]
+            imgs = [b64 for (_i, b64) in list_answer_images(aid, qno,bump=st.session_state.img_cache_bump)]
             if not (ans_text or imgs):
                 continue
             jobs.append((qno, info, ans_text, imgs))
@@ -1718,7 +1720,7 @@ def _answers_signature(head, answers, qidx, include_pending=False) -> str:
                 "score": (answers.get(k) or {}).get("score"),
                 "grading_text": (answers.get(k) or {}).get("grading_text"),
                 # 不把 image_b64 全量入签名，避免过大：只取每题的图片数量 & 暂存张数
-                "img_count": len(list_answer_images(head.get("attempt_id", ""), k)),
+                "img_count": len(list_answer_images(head.get("attempt_id", ""), k, bump=st.session_state.get("img_cache_bump", 0))),
                 "pending": (len(st.session_state.pending_images.get(head.get("attempt_id", ""), {}).get(k, {}))
                             if include_pending else 0),
             }
