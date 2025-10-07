@@ -272,6 +272,20 @@ def add_answer_images(aid: str, qno: str, img_bytes_list: List[bytes]) -> List[i
     except Exception as e:
         st.error(f"添加图片失败: {str(e)}")
         return []
+def replace_answer_images(aid: str, qno: str, img_bytes_list: List[bytes]) -> List[int]:
+    """
+    覆盖式写入：删除该题在 DB 里所有历史图片，然后写入提供的这批新图。
+    返回新写入的 idx 列表。
+    """
+    # 1) 清掉历史图（也会把 submission_answers.image_b64 置空）
+    delete_answer_images(aid, qno)  # 内部已有 bump
+
+    # 2) 写入新图（add_answer_images 会保证 upsert submission_answers）
+    idx_list = add_answer_images(aid, qno, img_bytes_list)
+
+    # 3) bump 一次，确保预览缓存失效
+    st.session_state.img_cache_bump = st.session_state.get("img_cache_bump", 0) + 1
+    return idx_list
 
 def reset_file_tracking(aid, qno):
     qno_key = f"files_{aid}_{qno}"
@@ -517,30 +531,31 @@ def remove_pending_image(aid: str, qno: str, h: str):
 
 def flush_all_pending_to_db(aid: str):
     """
-    在评分时把所有 pending 图片写入数据库。
-    使用 add_answer_images()（它内部会先 upsert submission_answers），
-    同时建立 hash→idx 映射，供“点上传列表里的 X”时删除 DB 记录用。
+    把所有 pending 的图片写入数据库，并“覆盖”对应题目的历史图片。
+    仅对“有 pending 的题目”覆盖；没有 pending 的题目保持原状。
     """
     aid_map = st.session_state.pending_images.get(aid, {})
     total = 0
+
     for qno, hashmap in list(aid_map.items()):
         if not hashmap:
             continue
 
-        # 按确定顺序写库，便于和返回的 idx_list 一一对应
-        items = list(hashmap.items())          # [(hash, bytes), ...]
+        # 以稳定顺序写库，便于映射
+        items = list(hashmap.items())           # [(hash, bytes), ...]
         img_bytes_list = [b for (_h, b) in items]
 
         try:
-            # ✅ 关键：用原有工具，内部会 upsert submission_answers
-            idx_list = add_answer_images(aid, qno, img_bytes_list)
+            # 覆盖式：先清空旧图，再写入新图
+            idx_list = replace_answer_images(aid, qno, img_bytes_list)
         except Exception as e:
             st.error(f"{qno} 写入图片失败：{e}")
             idx_list = []
 
         if idx_list:
-            # 建立 hash→idx 映射
+            # 建立 hash→idx 映射（供本会话内“X”回删 DB 用）
             h2idx = st.session_state.file_to_db_map.setdefault(aid, {}).setdefault(qno, {})
+            h2idx.clear()  # 覆盖式，先清理旧映射
             for (h, _b), idx in zip(items, idx_list):
                 h2idx[h] = idx
 
@@ -548,12 +563,14 @@ def flush_all_pending_to_db(aid: str):
             # 清空该题的 pending 缓存与尺寸统计
             clear_pending(aid, qno)
         else:
-            # 未成功写库，保留 pending，方便稍后重试
+            # 未成功写库 → 保留 pending，方便稍后重试
             st.warning(f"{qno} 暂存图片未写入数据库（将保留在缓冲区以便重试）。")
 
     if total > 0:
-        st.session_state.img_cache_bump += 1
+        # 再 bump 一次以确保 list_answer_images 缓存作废
+        st.session_state.img_cache_bump = st.session_state.get("img_cache_bump", 0) + 1
     return total
+
 
 
 
@@ -782,7 +799,7 @@ def render_upload_ui(aid: str, qno: str):
         st.session_state[qno_key] = curr_keys
 
         # 用一个提交按钮把这次所有变更合并
-        submitted = st.form_submit_button("更新预览/暂存")
+        submitted = st.form_submit_button("预览答案图片")
         if submitted:
             if removed_keys:
                 st.info(f"已移除 {len(removed_keys)} 张")
